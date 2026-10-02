@@ -1,14 +1,33 @@
 # content_verifier.py
 # 赛题二「信任守护师」内容鉴真引擎
 
+import argparse
 import base64
 import json
+import logging
 import os
+import sys
+import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 from openai import OpenAI
+
+try:
+    from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+except ImportError:  # pragma: no cover
+    retry = None
+    retry_if_exception_type = None
+    stop_after_attempt = None
+    wait_exponential = None
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+except ImportError:  # pragma: no cover
+    Console = None
+    Panel = None
 
 # 从 prompts 模块导入提示词
 try:
@@ -19,21 +38,22 @@ try:
         IMAGE_VERIFICATION_PROMPT,
         RISK_ASSESSMENT_PROMPT,
     )
-except ImportError:
-    # 如果 prompts_track2 不可用，使用内置默认值
+except ImportError:  # pragma: no cover
     CONTENT_VERIFIER_PROMPT = "请分析这段美妆内容是否存在虚假宣传、AI生成、夸大功效等问题。"
     IMAGE_VERIFICATION_PROMPT = "请分析这张图片是否存在AI生成、拼接篡改等痕迹。"
     RISK_ASSESSMENT_PROMPT = "请根据分析结果给出风险评级和处置建议。"
     AGENT_FOLLOWUP_PROMPT = "请根据分析结果与用户互动。"
     COT_TEMPLATE = ""
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-# ============================================================
-# 常量配置
-# ============================================================
-DEFAULT_TEXT_MODEL = "qwen3.8-flash"
-DEFAULT_REASONING_MODEL = "qwen-plus"
+DEFAULT_TEXT_MODEL = os.getenv("DEFAULT_MODEL", "qwen3.8-flash")
+DEFAULT_REASONING_MODEL = os.getenv("REASONING_MODEL", "qwen-plus")
+DEFAULT_MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
+DEFAULT_RETRY_COUNT = int(os.getenv("RETRY_COUNT", "3"))
+DEFAULT_RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF_BASE", "2"))
+DEFAULT_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "60"))
 
 # ============================================================
 # 客户端管理
@@ -51,6 +71,7 @@ def get_client() -> OpenAI:
         _client = OpenAI(
             api_key=api_key,
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+            timeout=DEFAULT_TIMEOUT,
         )
     return _client
 
@@ -85,25 +106,17 @@ def verify_content(
     image_path: Optional[str] = None,
     model: str = DEFAULT_TEXT_MODEL,
     use_cot: bool = True,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = 0.3,
 ) -> dict:
-    """
-    美妆内容鉴真主函数。
-
-    参数:
-        text: 待检测的文案内容（种草笔记/商品评价等）
-        image_path: 可选的图片路径（产品图/对比图/成分表等）
-        model: 使用的模型名称
-        use_cot: 是否启用思维链推理（更详细的分析但消耗更多token）
-
-    返回:
-        dict: 包含鉴真结果的字典
-    """
-    if not text or not str(text).strip():
+    """美妆内容鉴真主函数。"""
+    text = _normalize_text(text)
+    if not text:
         raise ValueError("text 不能为空")
 
     image_analysis = None
     if image_path and os.path.exists(image_path):
-        image_analysis = analyze_image(image_path, model=model)
+        image_analysis = analyze_image(image_path, model=model, max_tokens=2048)
 
     prompt = CONTENT_VERIFIER_PROMPT
     if use_cot and COT_TEMPLATE:
@@ -118,7 +131,12 @@ def verify_content(
         {"role": "user", "content": user_content},
     ]
 
-    result_text = _chat_completion(model=model, messages=messages, max_tokens=4096)
+    result_text = _chat_completion(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
     result = _parse_json_result(result_text)
 
     if image_analysis:
@@ -131,13 +149,12 @@ def verify_content_with_image(
     text: str,
     image_path: str,
     model: str = DEFAULT_TEXT_MODEL,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = 0.3,
 ) -> dict:
-    """
-    多模态鉴真：同时传入文案和图片，让多模态模型直接分析。
-
-    注意：需要模型支持多模态（如 qwen-vl-plus, qwen3.8-flash）
-    """
-    if not text or not str(text).strip():
+    """多模态鉴真：同时传入文案和图片，让多模态模型直接分析。"""
+    text = _normalize_text(text)
+    if not text:
         raise ValueError("text 不能为空")
     if not image_path or not os.path.exists(image_path):
         raise FileNotFoundError(f"图片文件不存在: {image_path}")
@@ -159,18 +176,27 @@ def verify_content_with_image(
         },
     ]
 
-    result_text = _chat_completion(model=model, messages=messages, max_tokens=4096)
+    result_text = _chat_completion(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
     return _parse_json_result(result_text)
 
 
-def analyze_image(image_path: str, model: str = DEFAULT_TEXT_MODEL) -> dict:
+def analyze_image(
+    image_path: str,
+    model: str = DEFAULT_TEXT_MODEL,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+) -> dict:
     """单独分析图片是否存在AI生成/篡改痕迹。"""
     if not image_path or not os.path.exists(image_path):
         raise FileNotFoundError(f"图片文件不存在: {image_path}")
 
     b64_image = encode_image(image_path)
     mime_type = get_image_mime(image_path)
-
     messages = [
         {"role": "system", "content": IMAGE_VERIFICATION_PROMPT},
         {
@@ -185,11 +211,21 @@ def analyze_image(image_path: str, model: str = DEFAULT_TEXT_MODEL) -> dict:
         },
     ]
 
-    result_text = _chat_completion(model=model, messages=messages, max_tokens=2048)
+    result_text = _chat_completion(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
     return _parse_json_result(result_text)
 
 
-def assess_risk(analysis_result: dict) -> dict:
+def assess_risk(
+    analysis_result: dict,
+    model: str = DEFAULT_REASONING_MODEL,
+    max_tokens: int = 2048,
+    temperature: float = 0.3,
+) -> dict:
     """根据鉴真分析结果进行风险评级和处置建议。"""
     if not isinstance(analysis_result, dict):
         raise ValueError("analysis_result 必须是字典")
@@ -206,14 +242,13 @@ def assess_risk(analysis_result: dict) -> dict:
     ]
 
     result_text = _chat_completion(
-        model=DEFAULT_REASONING_MODEL,
+        model=model,
         messages=messages,
-        max_tokens=2048,
-        temperature=0.3,
+        max_tokens=max_tokens,
+        temperature=temperature,
     )
     result = _parse_json_result(result_text)
 
-    # 一致性维度风险分层
     consistency = analysis_result.get("text_image_consistency", "")
     exaggerated = analysis_result.get("exaggerated_claims") or []
     endorsements = analysis_result.get("fake_endorsements") or []
@@ -230,13 +265,14 @@ def agent_followup(
     analysis_result: dict,
     user_message: Optional[str] = None,
     model: str = DEFAULT_REASONING_MODEL,
+    max_tokens: int = 1024,
+    temperature: float = 0.7,
 ) -> str:
     """Agent 多轮对话：根据鉴真结果与用户互动。"""
     if not isinstance(analysis_result, dict):
         raise ValueError("analysis_result 必须是字典")
 
     messages = [{"role": "system", "content": AGENT_FOLLOWUP_PROMPT}]
-
     if user_message:
         messages.append({"role": "user", "content": user_message})
 
@@ -247,27 +283,85 @@ def agent_followup(
         }
     )
 
-    return _chat_completion(model=model, messages=messages, max_tokens=1024, temperature=0.7)
+    return _chat_completion(
+        model=model,
+        messages=messages,
+        max_tokens=max_tokens,
+        temperature=temperature,
+    )
 
 
 # ============================================================
 # 工具函数
 # ============================================================
+def _normalize_text(text: Any) -> str:
+    if text is None:
+        return ""
+    return str(text).strip()
+
+
+def _should_retry_exception(exc: Exception) -> bool:
+    if exc is None:
+        return False
+    status_code = getattr(exc, "status_code", None)
+    if status_code is not None:
+        return status_code in {429, 500, 502, 503, 504}
+    message = str(exc).lower()
+    if "429" in message or "rate limit" in message:
+        return True
+    if "500" in message or "502" in message or "503" in message or "504" in message:
+        return True
+    if "timeout" in message or "temporarily unavailable" in message:
+        return True
+    return False
+
+
+def _execute_with_retry(func, *args, **kwargs):
+    """统一重试逻辑：3 次指数退避，429/5xx 才重试。"""
+    retries = int(os.getenv("RETRY_COUNT", str(DEFAULT_RETRY_COUNT)))
+    backoff_base = float(os.getenv("RETRY_BACKOFF_BASE", str(DEFAULT_RETRY_BACKOFF)))
+
+    for attempt in range(retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if attempt >= retries or not _should_retry_exception(exc):
+                raise
+            sleep_seconds = backoff_base ** attempt
+            logging.warning(
+                "API 调用失败，%s 秒后重试 (%s/%s): %s",
+                sleep_seconds,
+                attempt + 1,
+                retries,
+                exc,
+            )
+            time.sleep(sleep_seconds)
+
+    raise RuntimeError("重试逻辑结束，但未返回结果")
+
+
 def _chat_completion(
     model: str,
-    messages: list,
-    max_tokens: int,
+    messages: List[Dict[str, Any]],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = 0.3,
 ) -> str:
     """统一封装模型调用，减少重复代码并提升可维护性。"""
     client = get_client()
-    response = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-    )
-    return response.choices[0].message.content
+
+    def _request():
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        content = response.choices[0].message.content
+        if content is None:
+            raise RuntimeError("模型返回内容为空")
+        return content
+
+    return _execute_with_retry(_request)
 
 
 def _parse_json_result(text: str) -> dict:
@@ -277,26 +371,29 @@ def _parse_json_result(text: str) -> dict:
 
     parsed = str(text).strip()
 
-    # 去掉 markdown 代码块标记
     if parsed.startswith("```"):
         lines = parsed.split("\n")
         if len(lines) >= 3:
-            parsed = "\n".join(lines[1:-1]) if lines[0].startswith("```") else parsed
+            if lines[0].startswith("```"):
+                parsed = "\n".join(lines[1:-1])
 
     parsed = parsed.strip()
     if not parsed:
         return {"raw_output": "", "parse_error": "模型返回为空"}
 
-    # 尝试直接解析 JSON
     try:
-        return json.loads(parsed)
+        result = json.loads(parsed)
+        if isinstance(result, dict):
+            return result
+        return {"raw_output": result, "parse_error": "JSON 解析成功，但顶层数据不为对象"}
     except json.JSONDecodeError:
-        # 尝试提取最外层 JSON 对象
         start = parsed.find("{")
         end = parsed.rfind("}")
         if start != -1 and end != -1 and end > start:
             try:
-                return json.loads(parsed[start : end + 1])
+                result = json.loads(parsed[start : end + 1])
+                if isinstance(result, dict):
+                    return result
             except json.JSONDecodeError:
                 pass
 
@@ -305,6 +402,25 @@ def _parse_json_result(text: str) -> dict:
 
 def print_report(result: dict):
     """格式化打印鉴真报告。"""
+    if not isinstance(result, dict):
+        raise ValueError("result 必须是字典")
+
+    if Console is not None:
+        console = Console()
+        console.print(Panel.fit("美妆内容鉴真报告", style="bold cyan"))
+        console.print(f"[bold]AI生成检测:[/bold] {result.get('ai_generated_probability', result.get('ai_generated', '未评估'))}")
+        console.print(f"[bold]夸大功效:[/bold] {result.get('exaggerated_claims', [])}")
+        console.print(f"[bold]虚假背书:[/bold] {result.get('fake_endorsements', [])}")
+        console.print(f"[bold]图片篡改:[/bold] {result.get('image_tampering_suspected', result.get('image_tampering', '未评估'))}")
+        console.print(f"[bold]图文一致性:[/bold] {result.get('text_image_consistency', '未评估')}")
+        console.print(f"[bold]综合风险:[/bold] {result.get('risk_level', '未评估')}")
+        console.print(f"[bold]一致性维度风险:[/bold] {result.get('consistency_risk', '未评估')}")
+        if result.get("suggestions"):
+            console.print("[bold]处置建议:[/bold]")
+            for i, suggestion in enumerate(result.get("suggestions", []), 1):
+                console.print(f"  {i}. {suggestion}")
+        return
+
     print("\n" + "=" * 60)
     print("  美妆内容鉴真报告")
     print("=" * 60)
@@ -357,49 +473,73 @@ def print_report(result: dict):
     print("\n" + "=" * 60)
 
 
-# ============================================================
-# 命令行入口
-# ============================================================
-if __name__ == "__main__":
-    import sys
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="赛题二：内容鉴真与风险识别工具")
+    parser.add_argument("text", nargs="?", help="待检测文案内容")
+    parser.add_argument("image_path", nargs="?", help="待检测图片路径（可选）")
+    parser.add_argument("--image", dest="image_arg", help="待检测图片路径（可选）")
+    parser.add_argument("--model", default=os.getenv("DEFAULT_MODEL", DEFAULT_TEXT_MODEL), help="AI 模型名称")
+    parser.add_argument("--reasoning-model", default=os.getenv("REASONING_MODEL", DEFAULT_REASONING_MODEL), help="风险评估模型名称")
+    parser.add_argument("--no-cot", action="store_true", help="关闭思维链模式")
+    parser.add_argument("--output-json", help="将分析结果写入 JSON 文件")
+    parser.add_argument("--max-tokens", type=int, default=int(os.getenv("MAX_TOKENS", str(DEFAULT_MAX_TOKENS))), help="单次请求最大 token 数")
+    parser.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE", "0.3")), help="采样温度")
+    parser.add_argument("--verbose", action="store_true", help="打印详细日志")
+    return parser
 
-    print("美妆内容鉴真助手 v1.1")
-    print("赛题二「信任守护师」")
-    print()
 
-    if len(sys.argv) < 2:
-        print("用法:")
-        print("  1. 纯文本鉴真: python content_verifier.py <文案内容>")
-        print("  2. 图文鉴真:   python content_verifier.py <文案内容> <图片路径>")
-        print()
-        print("示例:")
-        print('  python content_verifier.py "这款精华液七天美白三个度，亲测有效！"')
-        print('  python content_verifier.py "亲测七天白三个度" product.jpg')
-        sys.exit(1)
+def _main(argv: Optional[List[str]] = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
-    text = sys.argv[1]
-    image_path = sys.argv[2] if len(sys.argv) > 2 else None
+    if args.verbose:
+        logging.basicConfig(level=logging.DEBUG, format="%(levelname)s: %(message)s")
+    else:
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
-    print("待检测文案: " + text[:80] + "...")
-    if image_path:
-        print("图片路径: " + image_path)
-    print()
+    text = _normalize_text(args.text)
+    image_path = args.image_arg or args.image_path
+
+a    if not text:
+        parser.error("请提供待检测文案，或通过 --image 传递图片路径")
+
+    if image_path and not os.path.exists(image_path):
+        raise FileNotFoundError(f"图片文件不存在: {image_path}")
 
     try:
-        if image_path and os.path.exists(image_path):
-            # 多模态模式
-            result = verify_content_with_image(text, image_path)
+        if image_path:
+            result = verify_content_with_image(
+                text=text,
+                image_path=image_path,
+                model=args.model,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+            )
         else:
-            # 纯文本模式
-            result = verify_content(text)
+            result = verify_content(
+                text=text,
+                image_path=None,
+                model=args.model,
+                use_cot=not args.no_cot,
+                max_tokens=args.max_tokens,
+                temperature=args.temperature,
+            )
 
         print_report(result)
 
-    except Exception as e:
-        print("[错误] " + type(e).__name__ + ": " + str(e))
-        print()
-        print("可能的原因:")
-        print("  1. 检查 .env 文件中 DASHSCOPE_API_KEY 是否正确")
-        print("  2. 如果使用了多模态功能，确认模型已开通（如 qwen-vl-plus）")
-        print("  3. 图片文件路径是否正确")
-        sys.exit(1)
+        if args.output_json:
+            output_path = Path(args.output_json)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"\n[JSON输出] 已保存到: {output_path}")
+
+        return 0
+
+    except Exception as exc:  # pragma: no cover
+        logging.exception("内容鉴真执行失败")
+        print(f"\n[错误] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
